@@ -1,0 +1,1977 @@
+#!/bin/sh
+
+set -o errexit
+
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/lbt"
+api_lbry_com="https://api.lbry.com"
+VERSION='2.2.0'
+
+
+format_bold='\033[1m'
+format_reset='\033[m'
+format_red='\033[38;5;1m'
+format_green='\033[38;5;2m'
+format_yellow='\033[38;5;3m'
+format_blue='\033[38;5;4m'
+format_magenta='\033[38;5;5m'
+format_cyan='\033[38;5;6m'
+format_black_bright='\033[38;5;8m'
+
+
+mkdir -p "$config_dir"
+
+if [ ! -f "$config_dir/mimetypes" ]; then
+	cat << EOF > "$config_dir/mimetypes"
+# This file determines rules for opening different types of files using "lbt open".
+# Rules are ordered by priority, the ones at the top have the highest priority.
+
+# First column is a glob pattern for matching MIME types.
+# Second column is the action:
+#    "save" means that the file must be downloaded before opening.
+#    "stream" means that the program can open the file as an HTTP stream.
+# Anything after the second column is ignored.
+
+video/*		stream
+audio/*		stream
+image/*		save
+text/html	stream
+application/pdf	save
+*		save
+EOF
+
+fi
+
+
+config_default_custom_open_command='run-mailcap --action-view "$mimetype:$1"'
+config_default_remote_lbrynet_url_http='localhost:5279'
+
+if [ ! -f "$config_dir/config.json" ]; then
+	cat << EOF > "$config_dir/config.json"
+{
+	"use_xdg_open": true,
+	"custom_open_command": "$config_default_custom_open_command",
+	"use_local_lbrynet": true,
+	"autostart_local_lbrynet": true,
+	"remote_lbrynet_url_http": "$config_default_remote_lbrynet_url_http"
+}
+EOF
+
+fi
+
+
+
+lbt_help_open() {
+	echo \
+"Usage: lbt open URL [options...]
+   or  lbt open #CLAIM_ID [options...]
+
+	-f, --save-file 	Save content as a file even if it can be streamed
+	-h, --help 		Print help
+	-m, --get-mime 		Get MIME type of the LBRY content and exit
+	-q, --quiet 		Don't output extra information, besides error messages
+	-s, --force-stream 	Use HTTP stream even if the file is saved on this machine"
+}
+
+lbt_help_ls() {
+	echo \
+"Usage: lbt ls [options...]
+
+	-b, --blobs			List downloaded and total blobs
+	-c, --channel			List channel name
+	    --color WHEN 		Output result with color (always,auto,never)
+	-d, --full			Only list content that's fully downloaded
+	-e, --empty			Only list content which has no downloaded blobs
+	-f, --files			Only list content that's saved as a local file
+	-F, --not-files			Only list content that's not saved as a local file
+	    --full-time 		Output time as full time and date
+	-h, --human-readable WHEN 	Output size in human readable units (always,auto,never)
+	    --help			Print help
+	-i, --claim-id 			List claim ID
+	-l, --pretty WHEN 		Synonym for --color --human-readable --table
+	-m, --mime			List MIME type
+	-n, --no-path			Don't list file paths
+	-N, --no-name			Don't list claim names
+	-P, --absolute-path		List absolute paths instead of relative
+	-R, --relative-path		List relative paths, even when piping output
+	-r, --reverse 			Reverse order when sorting
+	-s, --no-size			Don't list total of the file
+	    --sort KEY 			Sort values by key (name,channel,size,mime,time,claim-id)
+	-t, --no-time 			Don't list time of first access
+	-T, --table WHEN 		Output result as a table (always,auto,never)
+	    --unix-time 		Output time as UNIX timestamp (seconds since Jan 1, 1970)"
+}
+
+lbt_help_get() {
+	echo \
+"Usage: lbt get URL [options...]
+   or  lbt get #CLAIM_ID [options...]
+
+	-f, --file		Save content as a file and print download path
+	-F, --force-save 	Save content as a file even if that's not needed
+	-h, --help		Print help
+	-O, --output FILE 	Write output to FILE (or, if the content already exists on the local machine, create a sym-link)
+	-q, --quiet 		Don't output extra information, besides error messages
+	-r, --resolve		Instead of printing file to stdout, print either an HTTP URL or a local file path
+	-s, --stream		Create HTTP stream and print its URL
+	-t, --terminal		Enable printing output to the terminal"
+}
+
+lbt_help_feed() {
+	echo \
+"Usage: lbt feed [options...]
+   or  lbt feed CHANNELs... [optons...]
+
+	-c, --color WHEN 	Output result with color (always,auto,never)
+	-h, --help 		Print help
+	-n, --pages N		Show N pages worth of content instead of 1
+	-p, --start-page N 	Show content starting from Nth page
+	-s, --sfeed 		Output feed in sfeed format
+	-S, --plain 		Output feed in sfeed_plain format
+	-t, --time 		Always show release date and time"
+}
+
+lbt_help_rm() {
+	echo \
+"Usage: lbt rm URLs... [options...]
+   or  lbt rm #CLAIM_IDs... [optons...]
+
+	-c, --color WHEN 	Output information with color (always,auto,never)
+	-f, --file 		If content was saved as a file in the downloads directory, delete it
+	-h, --help	 	Print help
+	-n, --no-blobs 		Don't remove stored blobs (requires --file)
+	-q, --quiet 		Don't output extra information, besides error messages"
+}
+
+
+json_value() {
+	printf '%s' "$1" | jq -r ".$2"
+}
+
+result_value() {
+	printf '%s' "$1" | jq -r ".result.$2"
+}
+
+# from dylanaraps' Pure Sh Bible, MIT License
+trim_quotes() {
+
+	# Disable globbing.
+	# This makes the word-splitting below safe.
+	set -f
+
+	# Store the current value of 'IFS' so we
+	# can restore it later.
+	old_ifs=$IFS
+
+	# Set 'IFS' to ["'].
+	IFS=\"\'
+
+	# Create an argument list, splitting the
+	# string at ["'].
+	#
+	# Disable this shellcheck error as it only
+	# warns about word-splitting which we expect.
+	# shellcheck disable=2086
+	set -- $1
+
+	# Set 'IFS' to blank to remove spaces left
+	# by the removal of ["'].
+	IFS=
+
+	# Print the quote-less string.
+	printf '%s' "$*"
+
+	# Restore the value of 'IFS'.
+	IFS=$old_ifs
+
+	# Re-enable globbing.
+	set +f
+}
+
+
+
+lbrynet_check_error() {
+	case "$1" in
+		\{* )
+			#If starts with {. assume valid JSON
+			case "$1" in
+				*'"error": '* )
+					print_error "Error in LBRY daemon:"
+					print_error "$(result_value "$1" 'error')"
+					exit 1
+					;;
+			esac
+			;;
+		* )
+			print_error "Error."
+			print_error "$1"
+			exit 1
+			;;
+	esac
+}
+
+
+is_running() {
+	case "$1" in
+		\{* )
+			#If starts with {, assume valid JSON
+			case "$1" in
+				*'"is_running": true'* )
+					return 0
+					;;
+			esac
+			;;
+	esac
+	return 1
+}
+
+lbrynet_start_if_needed() {
+	if ! pidof "lbrynet" > /dev/null; then
+		if lbt_config_bool 'autostart_local_lbrynet' true; then
+			if ! command -v "lbrynet" > /dev/null; then
+				print_error 'Unable to find "lbrynet" executable in $PATH'
+				print_error "If you've installed LBRY on this system, see"
+				print_error "https://lbry.com/faq/how-to-cli for where to find lbrynet."
+				return 1
+			fi
+			printf_info "Starting LBRY daemon... "
+			lbrynet start 2>/dev/null > /dev/null &
+			while sleep 0.5; do
+				lbrynet_status=$(lbrynet status)
+				if is_running "$lbrynet_status"; then
+					print_info "Done."
+					break
+				fi
+			done
+		else
+			print_error "Error: lbrynet is not running."
+			return 1
+		fi
+	fi
+}
+
+
+lbt_config_string() {
+	(printf '%s' "$lbt_config" | jq ".$1" --raw-output --exit-status) || printf '%s' "$2"
+}
+
+lbt_config_bool() {
+	value="$(json_value "$lbt_config" "$1")"
+	if [ "$value" = 'null' ] || [ -z "$value" ]; then
+		value="$2"
+	fi
+	[ "$value" = 'true' ]
+}
+
+init_lbt_config() {
+	lbt_config=$(cat "$config_dir/config.json")
+
+	if lbt_config_bool 'use_local_lbrynet' true; then
+		lbrynet_local=y
+
+		lbrynet_start_if_needed
+
+		lbrynet_config=$(lbrynet settings get)
+		lbrynet_check_error "$lbrynet_config"
+		api_server=$(json_value "$lbrynet_config" "api")
+	else
+		api_server=$(lbt_config_string 'remote_lbrynet_url_http' "$config_default_remote_lbrynet_url_http")
+	fi
+}
+
+api_get() {
+	curl --silent --show-error "$api_server" -d"$1"
+}
+
+lbrynet_get() {
+	api_get "{\"method\": \"get\", \"params\": {\"uri\": \"$1\"}}"
+}
+
+lbrynet_get_save() {
+	api_get "{\"method\": \"get\", \"params\": {\"uri\": \"$1\", \"save_file\": true}}"
+}
+
+lbrynet_search_claim_id_local() {
+	claim_id="${1#\#}"
+	claim_info="$(api_get "{\"method\": \"file_list\", \"params\": {\"claim_id\": \"$claim_id\"}}")"
+	lbrynet_check_error "$claim_info"
+
+	if [ "$(result_value "$claim_info" "total_items")" -ne 1 ]; then
+		print_error "Could not find claim with ID $claim_id among saved files"
+		exit 1
+	fi
+	printf '%s' "$claim_info" | jq '.result.items|.[]'
+}
+
+lbrynet_search_claim_id() {
+	claim_id="${1#\#}"
+	claim_info="$(api_get "{\"method\": \"claim_search\", \"params\": {\"claim_id\": \"$claim_id\"}}")"
+	lbrynet_check_error "$claim_info"
+
+	if [ "$(result_value "$claim_info" "total_items")" -ne 1 ]; then
+		print_error "Could not find claim with ID $claim_id"
+		exit 1
+	fi
+	printf '%s' "$claim_info" | jq '.result.items|.[]'
+}
+
+lbrynet_get_claim_id() {
+	lbrynet_info="$(api_get "{\"method\": \"resolve\", \"params\": {\"urls\": [\"$1\"]}}")"
+	lbrynet_check_error "$lbrynet_info"
+	lbrynet_info="$(printf '%s' "$lbrynet_info" | jq '.result|to_entries|.[0]|.value')"
+	printf '%s' "$lbrynet_info" | jq --raw-output '.claim_id'
+}
+
+
+is_download_complete() {
+	case "$1" in
+		*'"completed": true'* )
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+print_info() {
+	if [ -z "$quiet" ]; then
+		>&2 echo "$@"
+	fi
+}
+
+print_error() {
+	#>&2 printf '\e[1;31m'"$@"'\e[0m\n' 
+	>&2 echo "$@"
+}
+
+printf_info() {
+	if [ -z "$quiet" ]; then
+		# shellcheck disable=SC2059
+		>&2 printf "$@"
+	fi
+}
+
+
+# shellcheck disable=SC1091
+. gettext.sh
+
+TEXTDOMAIN=lbt
+export TEXTDOMAIN
+
+check_incompatible() {
+	# shellcheck disable=SC2034,SC2016
+	if [ -n "$1" ] && [ -n "$2" ]; then
+		opt1="$3"
+		opt2="$4"
+		>&2 eval_gettext 'Error: $opt1 and $opt2 are incompatible options.'; echo
+		exit 1
+	fi
+}
+
+
+get_lbry_url_from_youtube() {
+	printf_info "%s: querying LBRY x YouTube Sync service... " "$1"
+	lbry_url="$(curl "$api_lbry_com/yt/resolve?video_ids=$1" --max-time 10 --silent --show-error | jq ".data.videos[\"$1\"]" --raw-output)"
+	if [ "$lbry_url" = "null" ] || [ -z "$lbry_url" ]; then
+		print_error "LBRY video for $1 not found."
+		exit 1
+	else
+		print_info "Done."
+	fi
+	printf '%s' "$lbry_url"
+}
+
+
+normalize_lbry_url() {
+	case "$1" in
+		*youtube*/watch* )
+			get_lbry_url_from_youtube "$(printf '%s' "$1" | sed 's|.*[\?&]v=||; s|&.*||')"
+			return
+			;;
+		*youtube*/v/* )
+			get_lbry_url_from_youtube "$(printf '%s' "$1" | sed 's|.*/v/||; s|[?&].*||')"
+			return 
+			;;
+		*youtu.be/* )
+			get_lbry_url_from_youtube "${1##https://youtu.be/}"
+			return
+			;;
+	esac
+
+	sed_command='s/%3A/\#/g; s/%40/@/g; s/%23/\#/g; s/?.*//'
+	case "$1" in
+		https://lbry.tv/* | http://lbry.tv/* )
+			sed_command="$sed_command; s|.*lbry\.tv/||"
+			;;
+		https://open.lbry.com/* | http://open.lbry.com/* )
+			sed_command="$sed_command; s|.*open\.lbry\.com/||"
+			;;
+		https://odysee.com/* | http://odysee.com/* )
+			sed_command="$sed_command; s|.*odysee\.com/||"
+			;;
+		https://* | http://* )
+			print_error "Not a known LBRY website: $1"
+			exit 1
+			;;
+		*)
+			sed_command="$sed_command; s|lbry://||"
+			;;
+	esac
+	sed_command="$sed_command; s/:/#/g; s|^|lbry://|"
+	printf '%s' "$1" | sed "$sed_command"
+}
+
+download() {
+	printf_info "Downloading..."
+
+	while true; do
+		lbrynet_info="$(lbrynet_get_save "$1")"
+		lbrynet_check_error "$lbrynet_info"
+
+		blobs_total="$(result_value "$lbrynet_info" "blobs_in_stream")"
+		blobs_completed="$(result_value "$lbrynet_info" "blobs_completed")"
+		printf_info '\rDownloading... %d/%d' "$blobs_completed" "$blobs_total"
+
+
+		if [ "$blobs_completed" -ge "$blobs_total" ]; then
+			break
+		fi
+		sleep 0.5
+	done	
+	printf_info "\nSaving to file... "
+	while ! is_download_complete "$lbrynet_info"; do
+		# Wait for the file to get saved
+		lbrynet_info="$(lbrynet_get_save "$1")"
+		lbrynet_check_error "$lbrynet_info"
+		
+		written_bytes="$(result_value "$lbrynet_info" "written_bytes")"
+		written_bytes="$(numfmt --to=iec-i "$written_bytes")"
+		total_bytes="$(result_value "$lbrynet_info" "total_bytes")"
+		total_bytes="$(numfmt --to=iec-i "$total_bytes")"
+
+		printf_info '\rSaving to file... %s/%s' "$written_bytes" "$total_bytes"
+		sleep 0.5
+	done
+	printf_info '\033[2K\rSaving to file... Done.\n'
+	
+	result_value "$lbrynet_info" "download_path"
+}
+
+
+lbry_get_url() {
+	if [ "$1" = "stream" ]; then
+		result_value "$lbrynet_info" "streaming_url"
+	elif [ "$1" = "save" ]; then
+		if is_download_complete "$lbrynet_info"; then
+			result_value "$lbrynet_info" "download_path"
+		else
+			download "$2"
+		fi
+	else
+		print_info "Unknown action: $1"
+		exit 1
+	fi
+}
+
+do_mimetype_action() {
+	mimetype_action=$(printf '%s' "$1" | cut -d' ' -f2)
+
+	if [ -n "$save" ]; then
+		action="save"
+		check_incompatible "$save" "$force_stream" "--save-file" "--force_stream"
+	elif [ -n "$force_stream" ]; then
+		action="stream"
+	else
+		if [ "$mimetype_action" = "stream" ] && is_download_complete "$lbrynet_info"; then
+			action="save"
+		else
+			action="$mimetype_action"
+		fi
+	fi
+
+
+	url=$(lbry_get_url "$action" "$3")
+
+
+	if lbt_config_bool 'use_xdg_open' true; then
+		print_info "Type: $2"
+		application="$(xdg-mime query default "$2")"
+		print_info "Application: $application"
+		( gtk-launch "$application" "$url" )
+	else
+		command=$(lbt_config_string 'custom_open_command' "$config_default_custom_open_command" \
+				| sed "s|\$1|$url|g; s|\$mimetype|$2|g")
+		print_info "Command: $command"
+		( eval "$command" )
+	fi
+}
+
+handle_lbry_url() {
+	# Ignore comments in config file and normalize whitespaces
+	sed 's/\s\+/ /g; /^ *#/d; s/#.*//' < "$1" \
+		| while read -r line; do
+			mimetype_pattern="$(printf '%s' "$line" | cut -d' ' -f1)"
+
+			# shellcheck disable=SC2254
+			case "$2" in
+				$mimetype_pattern) 
+					do_mimetype_action "$line" "$2" "$3"
+					exit 0
+					;;
+			esac
+		done
+}
+
+
+
+
+
+lbt_print_usage() {
+	echo \
+"Available commands:
+	feed 	See the latest content from LBRY channels
+	get 	Get content from an LBRY URL
+	ls 	List stored LBRY content
+	open 	Open LBRY content in the user's preferred application
+	rm 	Delete stored LBRY content"
+}
+
+
+lbt_open() {
+	options=mhfsq
+	longopts=get-mime,help,save-file,force-stream,quiet
+	parsed=$(getopt --options=$options --longoptions=$longopts --name "$0" -- "$@")
+	eval set -- "$parsed"
+
+	while true; do
+		case "$1" in
+			-h|--help)
+				help=y
+				shift
+				;;
+			-m|--get-mime)
+				get_mimetype=y
+				shift
+				;;
+			-f|--save-file)
+				save=y
+				shift
+				;;
+			-s|--force-stream)
+				force_stream=y
+				shift
+				;;
+			-q|--quiet)
+				quiet=y
+				shift
+				;;
+			--)
+				shift
+				break
+				;;
+			*)
+				echo "Programming error"
+				echo "$1"
+				exit 1
+				;;
+		esac
+	done
+
+
+
+	if [ -n "$help" ]; then
+		lbt_help_open
+		exit 0
+	fi
+
+
+
+	if [ -z "$1" ]; then
+		echo "Usage: lbt open URL [option...]"
+		echo "Try 'lbt open --help' to get more information"
+		exit 1
+	fi
+
+	case "$1" in
+		\#* )
+			is_claim_id=y
+			;;
+		* )
+			url="$(normalize_lbry_url "$1")"
+			if [ "$url" != "$1" ]; then
+				print_info "Resolving $url..."
+			fi
+			;;
+	esac
+
+
+	init_lbt_config
+
+	if [ -n "$is_claim_id" ]; then
+		claim_info="$(lbrynet_search_claim_id "$1")"
+		print_info "Searching for claim ID... "
+		url="$(json_value "$claim_info" "canonical_url")"
+		print_info "Resolving $url..."
+	fi
+	lbrynet_info="$(lbrynet_get "$url")"
+	lbrynet_check_error "$lbrynet_info"
+
+
+	mimetype=$(result_value "$lbrynet_info" "mime_type")
+
+	if [ -n "$get_mimetype" ]; then
+		echo "MIME type is $mimetype"
+		exit 0
+	fi
+
+	handle_lbry_url "$config_dir/mimetypes" "$mimetype" "$url"
+}
+
+
+
+
+output_to_file() {
+	if [ "$lbrynet_local" = y ] && is_download_complete "$2"; then
+		download_path=$(result_value "$2" "download_path")
+		if [ -n "$force_save" ]; then
+			printf_info "Copying from %s... " "$download_path"
+			cp "$download_path" "$1"
+			print_info "Done."
+		else
+			ln -s "$download_path" "$1"
+			printf_info "Created symlink from %s to %s" "$1" "$download_path"
+		fi
+		exit 0
+	fi
+	if [ -n "$quiet" ]; then
+		curl_initial_args="--silent --show-error"
+	else
+		curl_initial_args="--progress-meter"
+	fi
+	curl "$curl_initial_args" "$(result_value "$2" "streaming_url")" -o "$1"
+	exit 0
+}
+
+
+lbt_get() {
+	options=rhfstO:o:Fq
+	longopts=resolve,help,file,stream,terminal,output:,force-save,quiet
+	parsed=$(getopt --options=$options --longoptions=$longopts --name "$0" -- "$@")
+	eval set -- "$parsed"
+	
+	while true; do
+		case "$1" in
+			-h|--help)
+				help=y
+				shift
+				;;
+			-r|--resolve)
+				resolve=y
+				shift
+				;;
+			-f|--file)
+				save=y
+				shift
+				;;
+			-s|--stream)
+				force_stream=y
+				shift
+				;;
+			-t|--terminal)
+				allow_terminal=y
+				shift
+				;;
+			-o|-O|--output)
+				output_file="$2"
+				shift 2
+				;;
+			-F|--force-save)
+				force_save=y
+				shift
+				;;
+			-q|--quiet)
+				quiet=y
+				shift
+				;;
+			--)
+				shift
+				break
+				;;
+			*)
+				echo "Programming error: unknown parameter $1"
+				exit 1
+				;;
+		esac
+	done
+
+	if [ -n "$help" ]; then
+		lbt_help_get
+		exit 0
+	fi
+
+	if [ -n "$quiet" ]; then
+		allow_terminal=y
+	fi
+
+	if [ -z "$1" ]; then
+		echo "Usage: lbt get URL [option...]"
+		echo "Try 'lbt get --help' to get more information"
+		exit 1
+	fi
+
+
+	check_incompatible "$output_file" "$resolve" "--output" "--resolve"
+
+	check_incompatible "$save" "$force_stream" "--file" "--stream"
+	if [ -n "$save" ]; then
+		action="save"
+		if [ -z "$resolve" ]; then
+			print_error "Error: --file option must be used with --resolve"
+			exit 1
+		fi
+	elif [ -n "$force_stream" ]; then
+		action="stream"
+		if [ -z "$resolve" ]; then
+			print_error "Error: --stream option must be used with --resolve"
+			exit 1
+		fi
+	else
+		if [ -n "$resolve" ]; then
+			print_error "Error: either --file or --stream option must be used with --resolve"
+			exit 1
+		fi
+	fi
+
+	if [ -z "$resolve" ] && [ -z "$output_file" ] && [ -z "$allow_terminal" ] && [ -t 1 ]; then
+		print_info "Are you sure you want to print this data into a terminal?"
+		printf_info "\n(use the --terminal option to skip this)\033[F"
+		printf_info "Type 'y' to proceed, or 'n' to exit: "
+	
+		first_print=y
+		while read -r result; do
+			if [ -n "$first_print" ]; then
+				printf_info '\n'
+				unset first_print
+			fi
+
+			if [ "$result" = y ]; then
+				break
+			elif [ "$result" = n ]; then
+				exit 0
+			fi
+			printf_info "Type 'y' to proceed, or 'n' to exit: "
+		done
+	fi
+
+
+	init_lbt_config
+
+
+	case "$1" in
+		\#* )
+			is_claim_id=y
+			;;
+		* )
+			url="$(normalize_lbry_url "$1")"
+			if [ "$url" != "$1" ]; then
+				print_info "Resolving $url..."
+			fi
+			;;
+	esac
+
+
+
+
+	if [ -n "$is_claim_id" ]; then
+		claim_info="$(lbrynet_search_claim_id "$1")"
+		print_info "Searching for claim ID... "
+		url="$(json_value "$claim_info" "canonical_url")"
+		print_info "Resolving $url..."
+	fi
+
+	lbrynet_info="$(lbrynet_get "$url")"
+	lbrynet_check_error "$lbrynet_info"
+
+
+
+	if [ -n "$output_file" ]; then
+		output_to_file "$output_file" "$lbrynet_info"
+	elif [ -n "$resolve" ]; then
+		lbry_get_url "$action" "$url"
+	else
+		if [ -z "$action" ]; then
+			if is_download_complete "$lbrynet_info"; then
+				cat "$(result_value "$lbrynet_info" "download_path")"
+			else
+				curl --silent --show-error "$(result_value "$lbrynet_info" "streaming_url")"
+			fi
+		elif [ "$action" = "save" ]; then
+			if ! is_download_complete "$lbrynet_info"; then
+				cat "$(download "$url")"
+			else
+				cat "$(result_value "$lbrynet_info" "download_path")"
+			fi
+		elif [ "$action" = "stream" ]; then
+			curl --silent --show-error "$(result_value "$lbrynet_info" "streaming_url")"
+		fi
+	fi
+}
+
+
+lbrynet_list_files() {
+	page=1
+	total_pages=1
+
+	# Setting up filters for jq
+
+	# Download path must always be requested, so that we can later filter out
+	# --files or --not-files claims
+	columns="p: .download_path"
+	total_columns=1
+	if [ -n "$ls_claim_id" ]; then
+		columns="i: .claim_id, $columns"
+		claim_id_column=1
+		total_columns=$((total_columns + 1))
+	fi
+	if [ -n "$ls_mime_type" ]; then
+		columns="m: .mime_type, $columns"
+		mime_column=1
+		claim_id_column=$((claim_id_column + 1))
+		total_columns=$((total_columns + 1))
+	fi
+	if [ -z "$ls_no_name" ]; then
+		columns="n: .claim_name, $columns"
+		mime_column=$((mime_column + 1))
+		claim_id_column=$((claim_id_column + 1))
+		total_columns=$((total_columns + 1))
+	fi
+	if [ -z "$ls_no_time" ]; then
+		columns="a: .added_on, $columns"
+		time_column=1
+		mime_column=$((mime_column + 1))
+		claim_id_column=$((claim_id_column + 1))
+		total_columns=$((total_columns + 1))
+	fi
+	if [ -z "$ls_no_size" ]; then
+		columns="s: .total_bytes, $columns"
+		size_column=1
+		time_column=$((time_column + 1))
+		mime_column=$((mime_column + 1))
+		claim_id_column=$((claim_id_column + 1))
+		total_columns=$((total_columns + 1))
+	fi
+	if [ -n "$ls_channel" ]; then
+		columns="c: .channel_name, $columns"
+		size_column=$((size_column + 1))
+		time_column=$((time_column + 1))
+		mime_column=$((mime_column + 1))
+		claim_id_column=$((claim_id_column + 1))
+		total_columns=$((total_columns + 1))
+	fi
+	if [ -n "$ls_blobs" ]; then
+		columns="b: .blobs_completed, t: .blobs_in_stream, $columns"
+		size_column=$((size_column + 1))
+		time_column=$((time_column + 1))
+		mime_column=$((mime_column + 1))
+		claim_id_column=$((claim_id_column + 1))
+		total_columns=$((total_columns + 1))
+	fi
+
+	# In all of these cases, we need attributes like $is_full or $is_empty
+	if [ -n "$ls_color" ] || [ -z "$ls_no_size" ] || [ -n "$ls_full" ] \
+			|| [ -n "$ls_empty" ] || [ -n "$ls_not_empty" ]; then
+		columns="e: .blobs_completed, r: .blobs_remaining, $columns"
+	fi
+
+
+
+	#
+	# Here we will construct the final command for interpreting the JSON output
+	#
+
+	#no-op pipe, we will build a command on top of it
+	output_command="tee"
+
+	if [ -z "$ls_no_size" ]; then
+		if [ "$ls_sort" = "size" ]; then
+			if [ -n "$ls_reverse" ]; then
+				sort_params="--reverse"
+			fi
+			output_command="$output_command | sort $sort_params --field-separator='\"' --numeric-sort \
+				--key=$size_column --key=$((size_column + 1))"
+		fi
+
+		output_command="$output_command | awk \
+			'BEGIN { FS = \"\\\"\"; OFS = \"\\\"\" } \
+			{ sub(/./, \"\", \$$size_column); print }'"
+
+		if [ "$ls_human" = y ]; then
+			output_command="$output_command | sed 's/\"/!!TEMP!!\"/$size_column' \
+				| numfmt --to=iec-i --field=$((size_column + 1)) --delimiter=\\\" --invalid=ignore \
+				| sed 's/!!TEMP!!\"//g'"
+		else
+			output_command="$output_command | sed 's/\"//$size_column'"
+		fi
+	fi
+
+	if [ -z "$ls_no_time" ]; then
+		if [ -n "$ls_full_time" ]; then
+			time_style_recent='%Y-%m-%d %H:%M:%S %z'
+			time_style_nonrecent="$time_style_recent"
+		elif [ -z "$ls_unix_time" ]; then
+			time_style_recent='%b %d %R'
+			time_style_nonrecent='%b %d %Y'
+		fi
+
+		if [ -z "$ls_unix_time" ]; then
+			# Set TIME to the content of time_column, without color codes
+			# Replace TIME in time_column with a formatted time string
+			output_command="$output_command | awk \
+				'BEGIN { FS = \"\\\"\"; OFS = \"\\\"\" } { \
+				\
+					TIME = \$$time_column; \
+					CUR_TIME = systime(); \
+				\
+					sub(/\\033\[38;5;\\Sm/,\"\",TIME); \
+				\
+					if (strftime(\"%Y\", TIME) == strftime(\"%Y\", CUR_TIME)) \
+						FORMAT = \"$time_style_recent\"; \
+					else \
+						FORMAT = \"$time_style_nonrecent\"; \
+				\
+					sub(TIME, strftime(FORMAT, TIME), \$$time_column); \
+					print \
+				}'"
+		fi
+	fi
+
+	if [ -n "$ls_claim_id" ]; then
+		#print_error "$claim_id_column"
+		output_command="$output_command | awk \
+			'BEGIN { FS = \"\\\"\"; OFS = \"\\\"\" } { \
+			\
+				if (index(\$$claim_id_column, \"m\") > 0) \
+					START_CHAR = 9; \
+				else \
+					START_CHAR = 0; \
+			\
+				\$$claim_id_column = substr(\$$claim_id_column, 0, 0 + START_CHAR) \"#\" substr(\$$claim_id_column, START_CHAR + 1); \
+				print \
+			}'"
+	fi
+
+	if [ -n "$ls_mime_type" ] && [ "$ls_sort" = "mime" ]; then
+		if [ -n "$ls_reverse" ]; then
+			sort_params="--reverse"
+		fi
+		output_command="$output_command | sort $sort_params --field-separator='\"' --key=$mime_column"
+	fi
+
+	if [ -n "$ls_reverse" ]; then
+		# "size" and "mime" sort reversal is handled separately
+		if [ "$ls_sort" != "size" ] && [ "$ls_sort" != "mime" ]; then
+			output_command="$output_command | tac"
+		fi
+	fi
+
+	if [ "$ls_table" = y ]; then
+		output_command="$output_command | column --table --separator=\\\""
+	else
+		output_command="$output_command | sed s/\\\"/\\\t/g"
+	fi
+
+	#
+	# $output_command constructed
+	#
+
+	case "$ls_sort" in
+		claim_id )
+			list_params=', "sort": "claim_id"'
+			;;
+		name )
+			list_params=', "sort": "claim_name"'
+			;;
+		channel )
+			list_params=', "sort": "channel_name"'
+			;;
+		time )
+			list_params=', "sort": "added_on"'
+			;;
+		# sorting by size, MIME type, etc. is handled separately
+	esac
+
+	while [ $page -le $total_pages ]; do
+		list_info="$(api_get "{\"method\": \"file_list\", \"params\": {\"page\": $page, \"page_size\": 100$list_params}}")"
+		lbrynet_check_error "$list_info"
+
+
+		# Filter LBRY data using jq, output properties line by line
+		# Process them and combine them into one line
+		printf '%s' "$list_info" | jq ".result.items|.[]|{$columns}" | sed 's/,$//' | while read -r line; do
+			case "$line" in
+				\{ )
+					continue
+					;;
+				\} )
+					printf '\n'
+					continue
+					;;
+			esac
+			case "$line" in
+				#claim ID
+				\"i\"* )
+					if [ "$ls_color" = y ]; then
+						printf "$format_black_bright"
+					fi
+					printf '%s' "$line"
+					;;
+				#added on datetime
+				\"a\"* )
+					if [ "$ls_color" = y ]; then
+						printf "$format_blue"
+					fi
+					printf '%s' "$line"
+					;;
+				#blobs completed (for filtering, coloring etc)
+				"\"e\": 0" )
+					if [ -n "$ls_not_empty" ]; then
+						printf '""DELETE THIS""'
+					fi
+					is_empty=y
+					continue
+					;;
+				\"e\"* )
+					unset is_empty
+					if [ -n "$ls_empty" ]; then
+						printf '""DELETE THIS""'
+					fi
+					continue
+					;;
+				#blobs remaining (for filtering, coloring etc)
+				"\"r\": 0" )
+					is_full=y
+					continue
+					;;
+				\"r\"* )
+					unset is_full
+					if [ -n "$ls_full" ]; then
+						printf '""DELETE THIS""'
+					fi
+					continue
+					;;
+				#total bytes
+				\"s\"* )
+					if [ -n "$is_full" ]; then
+						# The numbers will be removed later,
+						# this is just so that the sort algorithm
+						# places empty, in-progress, and full files
+						# in the correct order
+						printf '3'
+						if [ "$ls_color" = y ]; then
+							printf "$format_green"
+						fi
+					elif [ -n "$is_empty" ]; then
+						printf '1'
+						if [ "$ls_color" = y ]; then
+							printf "$format_red"
+						fi
+						printf '!'
+					else
+						printf '2'
+						if [ "$ls_color" = y ]; then
+							printf "$format_yellow"
+						fi
+						printf '<'
+					fi
+					# Print color at the end of the previous column,
+					# as opposed to this column, so that
+					# numfmt doesn't have to deal with the escape codes.
+					printf ',\t%s' "$line"
+					;;
+				#MIME type
+				\"m\"* )
+					if [ "$ls_color" = y ]; then
+						printf "$format_magenta"
+					fi
+					printf '%s' "$line"
+					;;
+				#blobs completed
+				\"b\"* )
+					blobs_completed="$line"
+					continue
+					;;
+				#blobs total
+				\"t\"* )
+					if [ "$ls_color" = y ]; then
+						if [ -n "$is_full" ]; then
+							printf "$format_green"
+						elif [ -n "$is_empty" ]; then
+							printf "$format_red"
+						else
+							printf "$format_yellow"
+						fi
+					fi
+
+					printf '%s/%s' "$blobs_completed" "$line"
+					;;
+				#channel name
+				"\"c\": null" )
+					;;
+				\"c\"* )
+					if [ "$ls_color" = y ]; then
+						printf "${format_cyan}${format_bold}%s${format_reset}" "$line"
+					else
+						printf '%s' "$line"
+					fi
+					;;
+				#claim name
+				\"n\"* )
+					if [ "$ls_color" = y ]; then
+						if [ -n "$is_full" ]; then
+							printf "$format_green"
+						elif [ -n "$is_empty" ]; then
+							printf "$format_red"
+						else
+							printf "$format_yellow"
+						fi
+						printf "${format_bold}%s${format_reset}" "$line"
+					else
+						printf '%s' "$line"
+					fi
+					;;
+				#download path
+				"\"p\": null")
+					if [ -n "$ls_files" ]; then
+						printf '""DELETE THIS""'
+					fi
+					;;
+				\"p\"* )
+					if [ "$ls_color" = y ]; then
+						printf "$format_reset"
+					fi
+					if [ -n "$ls_not_files" ]; then
+						printf '""DELETE THIS""'
+					elif [ -n "$ls_relative_path" ]; then
+						filename="$(printf '%s' "$line" | cut -d' ' -f2-)"
+						filename="$(trim_quotes "$filename")"
+						printf '%s' "$(realpath --relative-base="$PWD" "$filename")"
+					elif [ -n "$ls_path" ]; then
+						printf '%s' "$line"
+					fi
+					;;
+			esac
+			printf ',\t'
+		done 
+
+		total_pages="$(result_value "$list_info" "total_pages")"
+		page=$((page+1))
+	#Clean up our "temporary" JSON, separate fields with " characters
+	done | sed '/""DELETE THIS""/d; s/"\w": //g; s/"//g; s/,\t/"/g; s/"$//' | eval "$output_command"
+}
+
+lbt_ls() {
+	options=nNPcfFNbmdeERT::sh::rl::ti
+	longopts=help,no-path,absolute-path,channel,files,not-files,no-name,blobs,mime-type,full,empty,not-empty,color::,relative-path,table::,no-size,human-readable::,sort:,reverse,pretty::,no-time,claim-id,full-time,unix-time
+	parsed=$(getopt --options=$options --longoptions=$longopts --name "$0" -- "$@")
+	eval set -- "$parsed"
+
+	while true; do
+		case "$1" in
+			--unix-time )
+				ls_unix_time=y
+				shift
+				;;
+			--full-time )
+				ls_full_time=y
+				shift
+				;;
+			-i|--claim-id )
+				ls_claim_id=y
+				shift
+				;;
+			-t|--no-time )
+				ls_no_time=y
+				shift
+				;;
+			-l|--pretty )
+				case "$2" in
+					"" )
+						ls_pretty=y
+						;;
+					always )
+						ls_pretty=y
+						;;
+					auto )
+						;;
+					never )
+						ls_pretty=n
+						;;
+					* )
+						print_error "Unknown parameter for --pretty-print: $2"
+						print_error "Available options: always, auto, never"
+						exit 1
+						;;
+				esac
+				shift 2
+				;;
+			-r|--reverse )
+				ls_reverse=y
+				shift
+				;;
+			--sort )
+				case "$2" in
+					claim-id )
+						ls_sort="claim_id"
+						;;
+					time )
+						ls_sort="time"
+						;;
+					name )
+						ls_sort="name"
+						;;
+					size )
+						ls_sort="size"
+						;;
+					channel )
+						ls_sort="channel"
+						;;
+					mime )
+						ls_sort="mime"
+						;;
+					* )
+						print_error "Unknown parameter for --sort: $2"
+						print_error "Available options: name, channel, size, mime"
+						exit 1
+						;;
+				esac
+				shift 2
+				;;
+			-E|--not-empty )
+				ls_not_empty=y
+				shift
+				;;
+			-h|--human-readable )
+				case "$2" in
+					"" )
+						ls_human=y
+						;;
+					always )
+						ls_human=y
+						;;
+					auto )
+						;;
+					never )
+						ls_human=n
+						;;
+					* )
+						print_error "Unknown parameter for --human-readable: $2"
+						print_error "Available options: always, auto, never"
+						exit 1
+						;;
+				esac
+				shift 2
+				;;	
+			-s|--no-size )
+				ls_no_size=y
+				shift
+				;;
+			-T|--table )
+				case "$2" in
+					"" )
+						ls_table=y
+						;;
+					always )
+						ls_table=y
+						;;
+					auto )
+						;;
+					never )
+						ls_table=n
+						;;
+					* )
+						print_error "Unknown parameter for --table: $2"
+						print_error "Available options: always, auto, never"
+						exit 1
+						;;
+				esac
+				shift 2
+				;;
+			--color )
+				case "$2" in
+					"" )
+						ls_color=y
+						;;
+					always )
+						ls_color=y
+						;;
+					auto )
+						;;
+					never )
+						ls_color=n
+						;;
+					* )
+						print_error "Unknown parameter for --color: $2"
+						print_error "Available options: always, auto, never"
+						exit 1
+						;;
+				esac
+				shift 2
+				;;
+			-d|--full )
+				ls_full=y
+				shift
+				;;
+			-e|--empty )
+				ls_empty=y
+				shift
+				;;
+			-m|--mime-type )
+				ls_mime_type=y
+				shift
+				;;
+			-N|--no-name )
+				ls_no_name=y
+				shift
+				;;
+			-R|--relative-path)
+				ls_relative_path=y
+				shift
+				;;
+			-b|--blobs )
+				ls_blobs=y
+				shift
+				;;
+			#-H|--sd-hash )
+			#	ls_sd_hash=y
+			#	shift
+			#	;;
+			-f|--files )
+				ls_files=y
+				shift
+				;;
+			-F|--not-files )
+				ls_not_files=y
+				shift
+				;;
+			--help )
+				help=y
+				shift
+				;;
+			-n|--no-path )
+				ls_no_path=y
+				shift
+				;;
+			-P|--absolute-path )
+				ls_path=y
+				shift
+				;;
+			-c|--channel )
+				ls_channel=y
+				shift
+				;;
+			-- )
+				shift
+				break
+				;;
+			* )
+				echo "Programming error"
+				echo "$1"
+				exit 1
+				;;
+		esac
+	done
+
+	check_incompatible "$ls_unix_time" "$ls_full_time" "--unix-time" "--full-time"
+	check_incompatible "$ls_unix_time" "$ls_no_time" "--unix-time" "--no-time"
+	check_incompatible "$ls_no_time" "$ls_full_time" "--no-time" "--full-time"
+
+	check_incompatible "$ls_no_path" "$ls_path" "--no-path" "--absolute-path"
+	check_incompatible "$ls_relative_path" "$ls_path" "--relative-path" "--absolute-path"
+	check_incompatible "$ls_relative_path" "$ls_no_path" "--relative-path" "--no-path"
+	if [ -z "$ls_no_path" ] && [ -z "$ls_path" ] && [ -z "$ls_relative_path" ]; then
+		if [ -t 1 ]; then
+			ls_relative_path=y
+		else
+			ls_path=y
+		fi
+	fi
+
+	check_incompatible "$ls_full" "$ls_empty" "--full" "--empty"
+	check_incompatible "$ls_not_empty" "$ls_empty" "--not-empty" "--empty"
+
+
+	if [ -z "$ls_color" ] && [ -n "$NO_COLOR" ]; then
+		ls_color=n
+	fi
+
+	if [ -z "$ls_pretty" ]; then
+		if [ -t 1 ]; then
+			ls_pretty=y
+		else
+			ls_pretty=n
+		fi
+	fi
+	ls_human="${ls_human:-$ls_pretty}"
+	ls_color="${ls_color:-$ls_pretty}"
+	ls_table="${ls_table:-$ls_pretty}"
+
+
+	check_incompatible "$ls_files" "$ls_not_files" "--files" "--not-files"
+	check_incompatible "$ls_no_name" "$ls_no_path" "--no-name" "--no-path"
+	if [ -n "$ls_no_name" ]; then
+		if [ -z "$ls_files" ]; then
+			print_error "Error: --no-name option requires --files"
+			exit 1
+		fi
+	fi
+
+
+	if [ "$ls_sort" = "mime" ] && [ -z "$ls_mime_type" ]; then
+		print_error "Error: --sort=mime requires --mime"
+		exit 1
+	elif [ "$ls_sort" = "size" ] && [ -n "$ls_no_size" ]; then
+		print_error "Error: --sort=size argument is incompatible with --no-size"
+		exit 1
+	fi
+	
+
+	if [ -n "$help" ]; then
+		lbt_help_ls
+		exit 0
+	fi
+
+
+	init_lbt_config
+
+
+	lbrynet_list_files
+}
+
+
+
+lbt_rm_single() {
+	# Not deleting blobs
+	
+	if [ -n "$rm_no_blobs" ]; then
+		case "$1" in
+			\#* )
+				claim_id="${1#\#}"
+				result="$(lbrynet_search_claim_id_local "$claim_id")"
+				url="$(printf '%s' "$result" | jq '[.claim_name, .claim_id] | join(":")' --raw-output)"
+				;;
+			* )
+				url="$(normalize_lbry_url "$1")"
+				result="$(lbrynet_get "$url" | jq '.result')"
+				lbrynet_check_error "$result"
+				;;
+		esac
+		if [ -n "$rm_color" ]; then
+			printf_info "${format_cyan}%s${format_reset} - deleting file... " "$url"
+		else
+			printf_info '%s - deleting file... ' "$url"
+		fi
+		if printf '%s' "$result" | grep -q '"download_path": null'; then
+			case "$1" in
+				\#* )
+					print_error "Not saved as file"
+					;;
+				* )
+					print_error "Not saved as file (try searching via claim ID?)"
+					;;
+			esac
+			exit 1
+		fi
+		path=$(printf '%s' "$result" | jq --raw-output '.download_path')
+		path=$(realpath --relative-base "$PWD" "$path")
+		rm -- "$path"
+		print_info "Deleted '$path'"
+		return
+	fi
+
+	# Deleting blobs
+	api_request='{"method": "file_delete", "params": {"delete_from_download_dir":'
+	if [ -n "$rm_file" ]; then
+		api_request="$api_request true"
+	else
+		api_request="$api_request false"
+	fi
+
+	case "$1" in
+		\#* )
+			claim_id="${1#\#}"
+			result="$(lbrynet_search_claim_id_local "$claim_id")"
+			url="$(printf '%s' "$result" | jq '[.claim_name, .claim_id] | join(":")' --raw-output)"
+			;;
+		* )
+			url="$(normalize_lbry_url "$1")"
+			claim_id="$(lbrynet_get_claim_id "$url")"
+			;;
+	esac
+	if [ -n "$rm_file" ]; then
+		action_string='deleting blobs and file...'
+	else
+		action_string='deleting blobs...'
+	fi
+	if [ -n "$rm_color" ]; then
+		printf_info "${format_cyan}%s${format_reset} - %s " "$url" "$action_string"
+	else
+		printf_info '%s - %s ' "$url" "$action_string"
+	fi
+	api_request="$api_request, \"claim_id\": \"$claim_id\"}}"
+
+	if api_get "$api_request" | grep -q '"result": false'; then
+		print_error "Failed."
+		exit 1
+	else
+		print_info "Done."
+	fi
+}
+
+lbt_rm() {
+	options=hfnc::q
+	longopts=help,file,no-blobs,color,quiet
+	parsed=$(getopt --options=$options --longoptions=$longopts --name "$0" -- "$@")
+	eval set -- "$parsed"
+
+	while true; do
+		case "$1" in
+			-h|--help )
+				help=y
+				shift
+				;;
+			-f|--file )
+				rm_file=y
+				shift
+				;;
+			-n|--no-blobs )
+				rm_no_blobs=y
+				shift
+				;;
+			-q|--quiet)
+				quiet=y
+				shift
+				;;
+			-c|--color )
+				case "$2" in
+					"" )
+						rm_color=y
+						;;
+					always )
+						rm_color=y
+						;;
+					auto )
+						;;
+					never )
+						rm_color=n
+						;;
+				esac
+				shift 2
+				;;
+			-- )
+				shift
+				break
+				;;
+			* )
+				echo "Programming error"
+				echo "$1"
+				exit 1
+				;;
+		esac
+	done
+
+
+
+	if [ -n "$help" ]; then
+		lbt_help_rm
+		exit 0
+	fi
+
+	if [ -n "$rm_no_blobs" ] && [ -z "$rm_file" ]; then
+		print_error "Error: --no-blobs requires --file"
+		exit 1
+	fi
+
+	if [ -z "$rm_color" ]; then
+		if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+			rm_color=y
+		else
+			rm_color=n
+		fi
+	fi
+
+	if [ -z "$1" ]; then
+		echo "Usage: lbt rm URL [option...]"
+		echo "Try 'lbt rm --help' to get more information"
+		exit 1
+	fi
+
+
+	init_lbt_config
+
+	while [ -n "$1" ]; do
+		lbt_rm_single "$1"
+		shift
+	done
+}
+
+
+
+lbt_feed() {
+	options=hsp:n:c::Sdt
+	longopts=help,sfeed,start-page:,pages:,color::,plain,time
+	parsed=$(getopt --options=$options --longoptions=$longopts --name "$0" -- "$@")
+	eval set -- "$parsed"
+
+	while true; do
+		case "$1" in
+			-h|--help )
+				help=y
+				shift
+				;;
+			-s|--sfeed )
+				feed_sfeed=y
+				shift
+				;;
+			-S|--plain )
+				feed_sfeed_plain=y
+				shift
+				;;
+			-t|--time )
+				feed_time=y
+				shift
+				;;
+			-p|--start-page )
+				feed_start_page="$2"
+				shift 2
+				;;
+			-n|--pages )
+				feed_pages="$2"
+				shift 2
+				;;
+			-c|--color )
+				case "$2" in
+					"" )
+						feed_color=y
+						;;
+					always )
+						feed_color=y
+						;;
+					auto )
+						;;
+					never )
+						feed_color=n
+						;;
+				esac
+				shift 2
+				;;
+			-- )
+				shift
+				break
+				;;
+			* )
+				echo "Programming error"
+				echo "$1"
+				exit 1
+				;;
+		esac
+	done
+
+
+
+	if [ -n "$help" ]; then
+		lbt_help_feed
+		exit 0
+	fi
+
+	
+
+	init_lbt_config
+
+	check_incompatible "$feed_sfeed" "$feed_sfeed_plain" "--sfeed" "--plain"
+	if [ -n "$feed_sfeed_plain" ]; then
+		feed_time=y
+	fi
+
+	# Assume that channel names, URLs, claim IDs can't have spaces...
+	if [ -n "$1" ]; then
+		input_channels="$*"
+	else
+		if [ ! -e "$config_dir/feeds" ]; then
+			if [ -t 0 ]; then
+				print_info "Note: missing file $config_dir/feeds"
+				print_info "and no channels are provided in arguments."
+				print_info
+				print_info "Enter channels here: (Ctrl+D to finish)"
+			fi
+			input_channels="$(tee)"
+		else
+			input_channels="$(cat "$config_dir/feeds")"
+		fi
+	fi 
+	for channel in $input_channels; do
+		# Make list of claim IDs in the format '"1234abc", "5678def"'
+		case "$channel" in
+			\#* )
+				claim_id="{$channel#\#}"
+				;;
+			* )
+				url="$(normalize_lbry_url "$channel")"
+				claim_id="$(lbrynet_get_claim_id "$url")"
+				;;
+		esac
+		if [ -z "$channel_id_list" ]; then
+			channel_id_list="\"$claim_id\""
+		else
+			channel_id_list="$channel_id_list, \"$claim_id\""
+		fi
+	done
+
+	if [ "$feed_color" = y ] && [ -n "$feed_sfeed" ]; then
+		print_error "Error: --color=always argument is incompatible with --sfeed"
+		exit 1
+	fi
+
+	if [ -z "$feed_color" ]; then
+		# output is a TTY and not outputting in sfeed format
+		if [ -t 1 ] && [ -z "$feed_sfeed" ] && [ -z "$NO_COLOR" ]; then
+			feed_color=y
+		else
+			feed_color=n
+		fi
+	fi
+
+	# Construct JQ command which will format JSON data
+	if [ -n "$feed_sfeed" ]; then
+		jq_command='.result.items| .[] | 
+			select(.value_type == "stream") | [
+				.value.release_time // 0,
+				( .value.title | gsub("\\s+"; " ")),
+				.short_url,
+				.value.description,
+				"plain",
+				.permanent_url,
+				.signing_channel.name,
+				null,
+				(.value.tags // [] | join("|"))
+			] | @tsv'
+	else
+		jq_command='.result.items| .[] | 
+			select(.value_type == "stream") | [
+				.value.release_time // 0,
+				.signing_channel.name,
+				.value.video.duration // .value.audio.duration // "",
+				.value.title,
+				.short_url
+			] | @tsv'
+	fi
+
+	feed_pages="${feed_pages:-1}"
+	feed_start_page="${feed_start_page:-1}"
+	page="${feed_start_page:-1}"
+
+	# Output JSON data to jq command
+	while [ "$page" -lt $((feed_start_page + feed_pages)) ]; do
+		claim_info="$(api_get "{\
+			\"method\": \"claim_search\",\
+			\"params\": {\
+				\"page\": $page,\
+				\"channel_ids\": [ $channel_id_list ],\
+				\"valid_channel_signature\": true,\
+				\"no_totals\": true,\
+				\"order_by\": \"release_time\"\
+			}}")"
+		lbrynet_check_error "$claim_info"
+		printf '%s' "$claim_info" | jq --raw-output "$jq_command"
+		page=$((page + 1))
+	done | if [ -z "$feed_sfeed" ]; then
+		awk 'BEGIN { FS="\t"; OFS="\t" };
+		{
+			if ($3 != "") {
+				seconds=$3;
+				minutes=int(seconds/60);
+				hours=int(minutes/60);
+				if (hours > 0) {
+					duration=sprintf("(%02i:", hours%60);
+				} else {
+					duration="(";
+				}
+				duration=sprintf("%s%02i:%02i) ", duration, minutes%60, seconds%60);
+			} else {
+				duration="";
+			}
+
+			if (sfeed_plain && length($4) > 70) {
+				name=substr($4, 1, 69)"…";
+			} else {
+				name=$4;
+			}
+
+			if (sfeed_plain && length($1) > 15) {
+				channel=substr($1, 1, 14)"…";
+			} else {
+				channel=$2;
+			}
+
+			if (show_time) {
+				time=strftime("%Y-%m-%d %H:%M", $1);
+				if (sfeed_plain) {
+					if (systime() - $1 < 60*60*24) {
+						if (color == "y") {
+							# Make timestamp bold
+							time="\033[1mN "time;
+						} else {
+							time="N "time;
+						}
+					} else {
+						time="  "time;
+					}
+				}
+			}
+
+			# Blue timestamp, bold cyan channel name, green duration + bold green title, 
+			# reset for URL
+			if (color == "y") {
+				if (show_time) {
+					printf "\033[38;5;4m"(time)(OFS);
+				}
+				print "\033[1m\033[38;5;6m"channel,
+				      "\033[m\033[38;5;2m"duration"\033[1m"name,
+				      "\033[m"$5;
+			} else {
+				if (show_time) {
+					printf (time)(OFS);
+				}
+				print channel, (duration)(name), $5;
+			}
+		}' color="$feed_color" sfeed_plain="$feed_sfeed_plain" show_time="$feed_time" \
+			| column --table --separator "$(printf '\t')"
+	else
+		# no-op
+		tee
+	fi
+}
+
+
+
+lbt_help_generic() {
+	echo "Usage: lbt COMMAND..."
+	echo "   or  lbt --help COMMAND..."
+	echo "   or  lbt --version"
+	lbt_print_usage			
+}
+
+lbt_version() {
+	if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+		printf '%s%s%s\n' "$format_bold" "lbt $VERSION" "$format_reset"
+	else
+		echo "lbt $VERSION"
+	fi
+	echo "LBRY daemon info:"
+
+	init_lbt_config
+	api_get '{"method": "version"}' | jq '.result'
+}
+
+while true; do
+	case "$1" in
+		"open" )
+			lbt_command="open"
+			shift
+			break
+			;;
+		"get" )
+			lbt_command="get"
+			shift
+			break
+			;;
+		"ls" )
+			lbt_command="ls"
+			shift
+			break
+			;;
+		"rm" )
+			lbt_command="rm"
+			shift
+			break
+			;;
+		"feed" )
+			lbt_command="feed"
+			shift
+			break
+			;;
+		"-h"|"--help" )
+			lbt_help=y
+			shift
+			;;
+		'-v'|'--version' )
+			lbt_version=y
+			shift
+			;;
+		"" )
+			if [ -n "$lbt_version" ]; then
+				lbt_version
+				exit 0
+			else
+				lbt_help_generic
+				if [ -n "$lbt_help" ] || [ -n "$lbt_version" ]; then
+					exit 0
+				else
+					exit 1
+				fi
+			fi
+			;;
+		* )
+			echo "Unknown command: $1"
+			lbt_print_usage
+			exit 1
+			;;
+	esac
+done
+
+if [ -n "$lbt_version" ]; then
+	lbt_version
+fi
+
+case "$lbt_command" in
+	open )
+		if [ -n "$lbt_help" ]; then
+			lbt_help_open
+			exit 0
+		fi
+		lbt_open "$@"
+		;;
+	get )
+		if [ -n "$lbt_help" ]; then
+			lbt_help_get
+			exit 0
+		fi
+		lbt_get "$@"
+		;;
+	ls )
+		if [ -n "$lbt_help" ]; then
+			lbt_help_ls
+			exit 0
+		fi
+		lbt_ls "$@"
+		;;
+	rm )
+		if [ -n "$lbt_help" ]; then
+			lbt_help_rm
+			exit 0
+		fi
+		lbt_rm "$@"
+		;;
+	feed )
+		if [ -n "$lbt_help" ]; then
+			lbt_help_feed
+			exit 0
+		fi
+		lbt_feed "$@"
+		;;
+	* )
+		echo "Programming error: unknown command??"
+		exit 1
+		;;
+esac
+
