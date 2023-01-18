@@ -1,0 +1,4 @@
+#! /usr/bin/env bash
+set -euo pipefail
+# fzf --preview 'bat --style=numbers --color=always --line-range :500 {}' | xargs open
+fzf | xargs open

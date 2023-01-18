@@ -1,0 +1,33 @@
+#! /usr/bin/env bash
+set -euo pipefail
+if [[ -z $(tmux ls) ]]; then
+	tmux new-session -d
+fi
+declare -a path=(
+"$HOME/git/*"
+"$HOME/.config/*"
+"$HOME/.local/bin"
+)
+tmuxLS=$(tmux ls | awk -F : '{print $1}' | xargs)
+dir=$(exa -d ${path[@]} | grep -v Icon | fzf-tmux --preview 'exa --tree -lu :500 {}')
+name=$(printf %s $dir|awk -F "/" '{print $NF}')
+exists=false
+zero=false
+for value in $tmuxLS
+do
+	if [[ $value = $name ]]; then
+		exists=true
+	elif [[ $value = "0" ]]; then
+		zero=true
+	fi
+done
+if [[ $exists = true ]]; then
+	tmux switch-client -t $name
+else
+	tmux new-session -c$dir -ds $name
+	if [[ $zero = true ]]; then
+		tmux kill-session -t 0
+	fi
+	tmux new-window -t $name  nvim $dir
+	tmux switch-client -t $name
+fi

@@ -1,0 +1,5 @@
+#! /usr/bin/env bash
+set -euo pipefail
+javac $1.java
+java $1
+rm *.class
