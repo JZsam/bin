@@ -13,7 +13,7 @@ declare -a path=(
 "$HOME/org/*"
 )
 tmuxLS=$(tmux ls | awk -F : '{print $1}' | xargs)
-dir=$(exa -d ${path[@]} | grep -v Icon | fzf --preview 'exa --tree -lu :500 {}')
+dir=$(exa -Dd ${path[@]} | grep -v Icon | fzf --preview 'exa --tree -lu :500 {}')
 name=$(printf %s $dir|awk -F "/" '{print $NF}')
 exists=false
 zero=false

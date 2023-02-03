@@ -107,4 +107,16 @@ declare -a convertType=(
 from=$(printf '%s\n' "${originType[@]}"|fzf +m -i --prompt="From >")
 to=$(printf '%s\n' "${convertType[@]}"|fzf +m -i --prompt="To >")
 file=$(fzf +m -i --prompt="File >")
-pandoc -f $from -t $to $file -o $(echo $file| sed "s/$from/$to/")
+if [[ $from = "vimwiki" ]]; then
+	if [[ $to = "markdown" ]];then 
+		pandoc -f $from -t $to $file -o $(echo $file| sed "s/$from/md/g")
+	else
+		pandoc -f $from -t $to $file -o $(echo $file| sed "s/wiki/$to/g")
+	fi
+elif [[ $from = "markdown" ]];then
+	pandoc -f $from -t $to $file -o $(echo $file| sed "s/md/$to/g")
+elif [[ $to = "markdown" ]];then 
+	pandoc -f $from -t $to $file -o $(echo $file| sed "s/$from/md/g")
+else
+	pandoc -f $from -t $to $file -o $(echo $file| sed "s/$from/$to/g")
+fi
