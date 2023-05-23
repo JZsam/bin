@@ -1,5 +1,0 @@
-#! /usr/bin/env bash
-set -euo pipefail
-cd $(git root)
-test -d target/classes/ && /usr/bin/env java -cp target/classes/ com.jzdoot.IA.App || echo "File dosen't exists"
-cd $OLDPWD

@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# echo $(awk -F , '{print $NF}' $1)
+# echo $(awk -F , '{print $NF}' $1 | xargs)
 qobuz-dl dl $(awk -F , '{print $NF}' $1)

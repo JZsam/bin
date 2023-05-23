@@ -1,0 +1,3 @@
+#! /usr/bin/env bash
+set -euo pipefail
+tmux attach-session -t $(tmux ls | awk -F : '{print $1}' | fzf)

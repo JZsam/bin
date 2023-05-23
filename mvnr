@@ -1,0 +1,8 @@
+#! /usr/bin/env bash
+set -euo pipefail
+clear
+mvn package
+java -jar target/*.jar
+# cd $(git root)
+# test -d target/classes/ && /usr/bin/env java -cp target/classes/ com.jzdoot.IA.App || echo "File dosen't exists"
+# cd $OLDPWD
