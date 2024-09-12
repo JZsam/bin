@@ -1,0 +1,16 @@
+#! /usr/bin/env bash
+set -euo pipefail
+shopt -s nullglob
+flacNames=(*.flac)
+shopt -u nullglob
+i=0
+while [ $i -lt ${#flacNames[@]} ]; do
+	printf "%s:%s | Flac: %s\n" "$i" "$((i+1))" "${flacNames[$i]}"
+	flac --decode "${flacNames[$i]}"
+	i=$((i+1))
+done
+dir=$(printf "%s/%s[WAV]" "$PWD" "$(printf %s "$PWD" | awk -F '/' '{print $NF}')")
+test ! -d  "$dir" && mkdir "$dir"
+shopt -s nullglob
+mv *.wav "$dir"
+shopt -u nullglob

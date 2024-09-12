@@ -1,3 +1,4 @@
 #! /usr/bin/env bash
 set -euo pipefail
-Fzf --preview 'bat --style=numbers --color=always --line-range :500 {}' | xargs nvim
+# fzf --preview 'bat --style=numbers --color=always --line-range :500 {}' | xargs nvim
+nvim $(fzf --preview 'bat --style=numbers --color=always --line-range :500 {}')
