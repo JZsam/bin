@@ -1,0 +1,10 @@
+#!/bin/bash
+if [[ -z $1 ]]; then
+	file=$(fzf --preview 'bat --style=numbers --color=always --line-range :500 {}')
+	newFile=$(echo $file|sed "s/md/docx/I")
+	pandoc -f md -t docx $file -o $newFile
+else
+	newFile=$(echo $1|sed "s/md/docx/I")
+	pandoc -f md -t docx $1 -o $newFile
+fi
+open $newFile
